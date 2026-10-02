@@ -1,0 +1,77 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-display: 'Shippori Mincho B1', 'Yu Mincho', serif;
+    --font-sans: 'Noto Sans JP', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+  }
+
+  body {
+    font-family: var(--font-sans);
+    background-color: #141210;
+    color: #F5F2EB;
+    overflow-x: hidden;
+  }
+
+  h1, h2, h3, .font-display {
+    font-family: var(--font-display);
+    text-wrap: balance;
+  }
+
+  .font-mono-tabular {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+}
+
+@keyframes dice-tumble {
+  0% {
+    transform: translate3d(0, 0, 0) rotate(0deg) scale(1);
+  }
+  25% {
+    transform: translate3d(-10px, -14px, 0) rotate(95deg) scale(1.06);
+  }
+  50% {
+    transform: translate3d(12px, 8px, 0) rotate(190deg) scale(0.96);
+  }
+  75% {
+    transform: translate3d(-8px, 10px, 0) rotate(285deg) scale(1.04);
+  }
+  100% {
+    transform: translate3d(0, 0, 0) rotate(360deg) scale(1);
+  }
+}
+
+@keyframes bowl-shake {
+  0%, 100% {
+    transform: translate3d(0, 0, 0);
+  }
+  20% {
+    transform: translate3d(-4px, 2px, 0);
+  }
+  40% {
+    transform: translate3d(4px, -3px, 0);
+  }
+  60% {
+    transform: translate3d(-3px, -2px, 0);
+  }
+  80% {
+    transform: translate3d(3px, 2px, 0);
+  }
+}
+
+.animate-dice-tumble {
+  animation: dice-tumble 180ms cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+.animate-bowl-shake {
+  animation: bowl-shake 180ms cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-dice-tumble,
+  .animate-bowl-shake {
+    animation: none;
+  }
+}

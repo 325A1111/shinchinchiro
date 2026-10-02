@@ -1,0 +1,6 @@
+{
+  "name": "雀荘・丁半 チンチロリン",
+  "description": "最大3回までの振り直し駆け引きと本格CPU対戦を楽しめる和風チンチロリン対局アプリ",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
