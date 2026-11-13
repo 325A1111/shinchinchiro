@@ -65,6 +65,16 @@ export const CPU_OPPONENTS: Record<CpuOpponentId, CpuOpponentProfile> = {
 };
 
 export function rollSingleDie(): DieValue {
+  if (typeof globalThis !== 'undefined' && globalThis.crypto?.getRandomValues) {
+    const buf = new Uint8Array(1);
+    // Rejection sampling: 252 is the largest multiple of 6 <= 255
+    while (true) {
+      globalThis.crypto.getRandomValues(buf);
+      if (buf[0] < 252) {
+        return ((buf[0] % 6) + 1) as DieValue;
+      }
+    }
+  }
   return (Math.floor(Math.random() * 6) + 1) as DieValue;
 }
 

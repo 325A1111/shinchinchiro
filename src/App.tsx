@@ -14,10 +14,7 @@ import {
   ASSETS,
   canPerformReroll,
   CPU_OPPONENTS,
-  evaluateDiceRoll,
   generateRandomTriplet,
-  settleRoundOutcomes,
-  shouldCpuReroll,
 } from './utils/chinchiroLogic';
 import { soundEngine } from './utils/sound';
 import { DiceBowlArena, JapaneseDie } from './components/DiceBowlArena';
@@ -29,6 +26,42 @@ import {
 } from './components/InfoViews';
 
 const MAX_REROLLS = 3;
+const SESSION_TOKEN_STORAGE_KEY = 'chinchiro_session_token';
+
+interface ServerSessionState {
+  opponentId: CpuOpponentId;
+  ruleMode: RerollRuleMode;
+  enableShonben: boolean;
+  startingFunds: number;
+  roundNumber: number;
+  dealer: 'PLAYER' | 'CPU';
+  playerFunds: number;
+  betAmount: number;
+  turnPhase: 'BETTING' | 'PLAYER_ROLLING' | 'ROUND_RESULT' | 'MATCH_OVER';
+  throwNumber: number;
+  remainingRerolls: number;
+  playerOutcome: RollOutcome | null;
+  playerRerollsUsed: number;
+  cpuOutcome: RollOutcome | null;
+  cpuRerollsUsed: number;
+  roundSettlement: {
+    winner: 'PLAYER' | 'CPU' | 'DRAW';
+    appliedMultiplier: number;
+    netDeltaPlayer: number;
+    summaryReason: string;
+  } | null;
+  cpuDialogue: string;
+  history: RoundHistoryRecord[];
+}
+
+interface CpuRollStep {
+  dice: DiceTriplet;
+  outcome: RollOutcome;
+  throwNumber: number;
+  remainingRerolls: number;
+  rerollsUsed: number;
+  dialogue: string;
+}
 
 export default function App() {
   // Navigation & Settings State
@@ -39,12 +72,14 @@ export default function App() {
   const [selectedOpponentId, setSelectedOpponentId] = useState<CpuOpponentId>('GENZO');
   const [startingFunds, setStartingFunds] = useState<number>(5000);
 
-  // Match State (CPU has infinite funds)
+  // Match State (Authoritatively synchronized with server)
   const [roundNumber, setRoundNumber] = useState<number>(1);
   const [dealer, setDealer] = useState<'PLAYER' | 'CPU'>('PLAYER');
   const [playerFunds, setPlayerFunds] = useState<number>(5000);
   const [betAmount, setBetAmount] = useState<number>(500);
   const [turnPhase, setTurnPhase] = useState<TurnPhase>('BETTING');
+  const [apiError, setApiError] = useState<string | null>(null);
+  const [isBusy, setIsBusy] = useState<boolean>(false);
 
   // Active Roll State inside the Bowl
   const [bowlDice, setBowlDice] = useState<DiceTriplet>([1, 1, 1]);
@@ -71,7 +106,12 @@ export default function App() {
   );
   const [history, setHistory] = useState<RoundHistoryRecord[]>([]);
 
-  // Timers cleanup ref
+  // Session & Timers Refs
+  const sessionTokenRef = useRef<string | null>(
+    typeof window !== 'undefined'
+      ? window.sessionStorage.getItem(SESSION_TOKEN_STORAGE_KEY)
+      : null
+  );
   const timerRefs = useRef<number[]>([]);
 
   const clearAllTimers = () => {
@@ -85,8 +125,87 @@ export default function App() {
     return id;
   };
 
+  const applyServerState = (s: ServerSessionState) => {
+    setSelectedOpponentId(s.opponentId);
+    setRerollRuleMode(s.ruleMode);
+    setEnableShonben(s.enableShonben);
+    setStartingFunds(s.startingFunds);
+    setRoundNumber(s.roundNumber);
+    setDealer(s.dealer);
+    setPlayerFunds(s.playerFunds);
+    setBetAmount(s.betAmount);
+    setTurnPhase(s.turnPhase);
+    setThrowNumber(s.throwNumber);
+    setRemainingRerolls(s.remainingRerolls);
+    setPlayerOutcome(s.playerOutcome);
+    setPlayerRerollsUsed(s.playerRerollsUsed);
+    setCpuOutcome(s.cpuOutcome);
+    setCpuRerollsUsed(s.cpuRerollsUsed);
+    setRoundSettlement(s.roundSettlement);
+    setCpuDialogue(s.cpuDialogue);
+    setHistory(s.history);
+
+    if (s.cpuOutcome && (s.turnPhase === 'ROUND_RESULT' || s.turnPhase === 'MATCH_OVER')) {
+      setActiveRoller('CPU');
+      setBowlDice(s.cpuOutcome.dice);
+    } else if (s.playerOutcome) {
+      setActiveRoller('PLAYER');
+      setBowlDice(s.playerOutcome.dice);
+    } else {
+      setActiveRoller('PLAYER');
+      setBowlDice([1, 1, 1]);
+    }
+  };
+
+  const apiRequest = async <T,>(
+    endpoint: string,
+    method: 'POST' | 'PATCH' | 'GET',
+    body?: Record<string, unknown>
+  ): Promise<T> => {
+    const headers: Record<string, string> = {
+      'Content-Type': 'application/json',
+    };
+    if (sessionTokenRef.current) {
+      headers['X-Session-Token'] = sessionTokenRef.current;
+    }
+
+    const res = await fetch(endpoint, {
+      method,
+      headers,
+      credentials: 'same-origin',
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    });
+
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(
+        typeof data?.error === 'string'
+          ? data.error
+          : '通信エラーが発生しました。'
+      );
+    }
+    return data as T;
+  };
+
+  const initSession = async () => {
+    try {
+      const data = await apiRequest<{
+        sessionToken: string;
+        state: ServerSessionState;
+      }>('/api/session/init', 'POST', {});
+      sessionTokenRef.current = data.sessionToken;
+      window.sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, data.sessionToken);
+      applyServerState(data.state);
+      setApiError(null);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : 'セッション初期化に失敗しました。');
+    }
+  };
+
   useEffect(() => {
+    void initSession();
     return () => clearAllTimers();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const currentOpponent = CPU_OPPONENTS[selectedOpponentId];
@@ -116,70 +235,106 @@ export default function App() {
     }
   };
 
-  // Start a fresh match with full funds
-  const startNewMatch = (customOpponentId?: CpuOpponentId, customFunds?: number) => {
+  // Start a fresh match with full funds via server
+  const startNewMatch = async (
+    customOpponentId?: CpuOpponentId,
+    customFunds?: number
+  ) => {
     clearAllTimers();
-    const oppId = customOpponentId ?? selectedOpponentId;
-    const funds = customFunds ?? startingFunds;
-    setRoundNumber(1);
-    setDealer('PLAYER');
-    setPlayerFunds(funds);
-    setBetAmount(Math.min(500, funds));
-    setTurnPhase('BETTING');
-    setBowlDice([1, 1, 1]);
     setIsRolling(false);
-    setActiveRoller('PLAYER');
-    setThrowNumber(0);
-    setRemainingRerolls(MAX_REROLLS);
-    setPlayerOutcome(null);
-    setPlayerRerollsUsed(0);
-    setCpuOutcome(null);
-    setCpuRerollsUsed(0);
-    setRoundSettlement(null);
-    setCpuDialogue(CPU_OPPONENTS[oppId].quotes.greeting);
+    setIsBusy(true);
+    setApiError(null);
+    try {
+      const data = await apiRequest<{
+        sessionToken: string;
+        state: ServerSessionState;
+      }>('/api/game/new', 'POST', {
+        opponentId: customOpponentId ?? selectedOpponentId,
+        startingFunds: customFunds ?? startingFunds,
+        ruleMode: rerollRuleMode,
+        enableShonben,
+      });
+      sessionTokenRef.current = data.sessionToken;
+      window.sessionStorage.setItem(SESSION_TOKEN_STORAGE_KEY, data.sessionToken);
+      applyServerState(data.state);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : '新規対局の開始に失敗しました。');
+    } finally {
+      setIsBusy(false);
+    }
   };
 
-  // Perform a Player roll (initial roll or re-roll 1..3)
-  const executePlayerRoll = (isInitialThrow: boolean) => {
-    if (isRolling) return;
+  const updateSettings = async (patch: {
+    opponentId?: CpuOpponentId;
+    ruleMode?: RerollRuleMode;
+    enableShonben?: boolean;
+    startingFunds?: number;
+  }) => {
+    setApiError(null);
+    try {
+      const data = await apiRequest<{ state: ServerSessionState }>(
+        '/api/game/settings',
+        'PATCH',
+        patch
+      );
+      setSelectedOpponentId(data.state.opponentId);
+      setRerollRuleMode(data.state.ruleMode);
+      setEnableShonben(data.state.enableShonben);
+      setStartingFunds(data.state.startingFunds);
+      setCpuDialogue(data.state.cpuDialogue);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : '設定の更新に失敗しました。');
+    }
+  };
+
+  // Perform a Player roll (initial roll or re-roll 1..3) verified on server
+  const executePlayerRoll = async (isInitialThrow: boolean) => {
+    if (isRolling || isBusy) return;
     if (!isInitialThrow && remainingRerolls <= 0) return;
 
     clearAllTimers();
+    setApiError(null);
+    setIsBusy(true);
     setTurnPhase('PLAYER_ROLLING');
     setActiveRoller('PLAYER');
     setIsRolling(true);
     soundEngine.playDiceRoll();
-
-    const nextThrowNum = isInitialThrow ? 1 : throwNumber + 1;
-    const nextRemainingRerolls = isInitialThrow
-      ? MAX_REROLLS
-      : Math.max(0, remainingRerolls - 1);
-    const nextRerollsUsed = isInitialThrow ? 0 : playerRerollsUsed + 1;
-
-    // Rapid visual dice scramble during 180ms animation
     setBowlDice(generateRandomTriplet());
 
-    scheduleTimeout(() => {
-      const finalDice = generateRandomTriplet();
-      const shonbenTriggered = enableShonben && Math.random() < 0.02;
-      const evaluated = evaluateDiceRoll(finalDice, shonbenTriggered);
+    try {
+      const endpoint = isInitialThrow ? '/api/game/roll' : '/api/game/reroll';
+      const payload = isInitialThrow ? { betAmount } : {};
+      const data = await apiRequest<{
+        dice: DiceTriplet;
+        outcome: RollOutcome;
+        state: ServerSessionState;
+      }>(endpoint, 'POST', payload);
 
-      setBowlDice(finalDice);
+      scheduleTimeout(() => {
+        setBowlDice(data.dice);
+        setIsRolling(false);
+        setIsBusy(false);
+        setThrowNumber(data.state.throwNumber);
+        setRemainingRerolls(data.state.remainingRerolls);
+        setPlayerOutcome(data.outcome);
+        setPlayerRerollsUsed(data.state.playerRerollsUsed);
+        setBetAmount(data.state.betAmount);
+        playOutcomeAudio(data.outcome);
+      }, 180);
+    } catch (err) {
       setIsRolling(false);
-      setThrowNumber(nextThrowNum);
-      setRemainingRerolls(nextRemainingRerolls);
-      setPlayerOutcome(evaluated);
-      setPlayerRerollsUsed(nextRerollsUsed);
-      playOutcomeAudio(evaluated);
-    }, 180);
+      setIsBusy(false);
+      setApiError(err instanceof Error ? err.message : 'ロール処理に失敗しました。');
+      void initSession();
+    }
   };
 
-  // Lock in Player's outcome and trigger CPU's turn
-  const lockPlayerOutcomeAndStartCpuTurn = () => {
-    if (!playerOutcome || isRolling) return;
+  // Lock in Player's outcome and play back server-verified CPU roll sequence
+  const lockPlayerOutcomeAndStartCpuTurn = async () => {
+    if (!playerOutcome || isRolling || isBusy) return;
     clearAllTimers();
-
-    const lockedRerolls = playerRerollsUsed;
+    setApiError(null);
+    setIsBusy(true);
     setTurnPhase('CPU_ROLLING');
     setActiveRoller('CPU');
     setThrowNumber(0);
@@ -188,160 +343,100 @@ export default function App() {
     setCpuRerollsUsed(0);
     setCpuDialogue(currentOpponent.quotes.rolling);
 
-    runCpuTurnLoop(playerOutcome, lockedRerolls, 1, MAX_REROLLS, 0);
-  };
+    try {
+      const data = await apiRequest<{
+        cpuSteps: CpuRollStep[];
+        settlement: ServerSessionState['roundSettlement'];
+        state: ServerSessionState;
+      }>('/api/game/stand', 'POST', {});
 
-  // Recursive CPU rolling loop with realistic pacing (up to 3 re-rolls)
-  const runCpuTurnLoop = (
-    lockedPlayerOutcome: RollOutcome,
-    lockedPlayerRerolls: number,
-    currentCpuThrow: number,
-    cpuRerollsLeft: number,
-    cpuRerollsCount: number
-  ) => {
-    setIsRolling(true);
-    soundEngine.playDiceRoll();
-    setBowlDice(generateRandomTriplet());
+      const playStep = (index: number) => {
+        const step = data.cpuSteps[index];
+        if (!step) {
+          applyServerState(data.state);
+          setIsRolling(false);
+          setIsBusy(false);
+          if (data.settlement?.winner === 'PLAYER') {
+            soundEngine.playWinSettlement();
+          } else if (data.settlement?.winner === 'CPU') {
+            soundEngine.playMissOrPenalty(false);
+          }
+          return;
+        }
 
-    scheduleTimeout(() => {
-      const finalDice = generateRandomTriplet();
-      const shonbenTriggered = enableShonben && Math.random() < 0.02;
-      const evaluated = evaluateDiceRoll(finalDice, shonbenTriggered);
+        setIsRolling(true);
+        soundEngine.playDiceRoll();
+        setBowlDice(generateRandomTriplet());
 
-      setBowlDice(finalDice);
+        scheduleTimeout(() => {
+          setBowlDice(step.dice);
+          setIsRolling(false);
+          setThrowNumber(step.throwNumber);
+          setRemainingRerolls(step.remainingRerolls);
+          setCpuOutcome(step.outcome);
+          setCpuRerollsUsed(step.rerollsUsed);
+          setCpuDialogue(step.dialogue);
+          playOutcomeAudio(step.outcome);
+
+          if (index + 1 < data.cpuSteps.length) {
+            scheduleTimeout(() => {
+              setCpuDialogue(
+                `${currentOpponent.quotes.reroll}（CPU振り直し 残り${step.remainingRerolls - 1}回）`
+              );
+              playStep(index + 1);
+            }, 700);
+          } else {
+            scheduleTimeout(() => {
+              playStep(index + 1);
+            }, 650);
+          }
+        }, 200);
+      };
+
+      playStep(0);
+    } catch (err) {
       setIsRolling(false);
-      setThrowNumber(currentCpuThrow);
-      setRemainingRerolls(cpuRerollsLeft);
-      setCpuOutcome(evaluated);
-      setCpuRerollsUsed(cpuRerollsCount);
-      playOutcomeAudio(evaluated);
-
-      // Update CPU reaction quote
-      if (
-        evaluated.yakuType === YakuType.PINZORO ||
-        evaluated.yakuType === YakuType.ARASHI ||
-        evaluated.yakuType === YakuType.SHIGORO
-      ) {
-        setCpuDialogue(currentOpponent.quotes.highYaku);
-      } else if (
-        evaluated.yakuType === YakuType.HIFUMI ||
-        evaluated.yakuType === YakuType.SHONBEN ||
-        evaluated.yakuType === YakuType.MENASHI
-      ) {
-        setCpuDialogue(currentOpponent.quotes.lowRoll);
-      }
-
-      // Decide if CPU wants to use one of its remaining re-rolls (up to 3)
-      const wantsReroll = shouldCpuReroll(
-        evaluated,
-        cpuRerollsLeft,
-        rerollRuleMode,
-        currentOpponent,
-        lockedPlayerOutcome
-      );
-
-      if (wantsReroll && cpuRerollsLeft > 0) {
-        scheduleTimeout(() => {
-          setCpuDialogue(
-            `${currentOpponent.quotes.reroll}（CPU振り直し 残り${cpuRerollsLeft - 1}回）`
-          );
-          runCpuTurnLoop(
-            lockedPlayerOutcome,
-            lockedPlayerRerolls,
-            currentCpuThrow + 1,
-            cpuRerollsLeft - 1,
-            cpuRerollsCount + 1
-          );
-        }, 700);
-      } else {
-        // CPU finishes its turn -> settle the round
-        scheduleTimeout(() => {
-          finalizeRound(
-            lockedPlayerOutcome,
-            lockedPlayerRerolls,
-            evaluated,
-            cpuRerollsCount
-          );
-        }, 650);
-      }
-    }, 200);
-  };
-
-  // Settle round outcomes and update funds & history
-  const finalizeRound = (
-    finalPlayer: RollOutcome,
-    finalPlayerRerolls: number,
-    finalCpu: RollOutcome,
-    finalCpuRerolls: number
-  ) => {
-    const result = settleRoundOutcomes(finalPlayer, finalCpu, betAmount);
-
-    const nextPlayerFunds = Math.max(0, playerFunds + result.netDeltaPlayer);
-
-    setRoundSettlement(result);
-    setPlayerFunds(nextPlayerFunds);
-
-    if (result.winner === 'PLAYER') {
-      soundEngine.playWinSettlement();
-      setCpuDialogue(currentOpponent.quotes.loseRound);
-    } else if (result.winner === 'CPU') {
-      soundEngine.playMissOrPenalty(false);
-      setCpuDialogue(currentOpponent.quotes.winRound);
-    } else {
-      setCpuDialogue('「同格の引き分けか。次の局で決着をつけよう。」');
-    }
-
-    const record: RoundHistoryRecord = {
-      roundNumber,
-      dealer,
-      betAmount,
-      playerOutcome: finalPlayer,
-      playerRerollsUsed: finalPlayerRerolls,
-      cpuOutcome: finalCpu,
-      cpuRerollsUsed: finalCpuRerolls,
-      winner: result.winner,
-      appliedMultiplier: result.appliedMultiplier,
-      netDeltaPlayer: result.netDeltaPlayer,
-      summaryReason: result.summaryReason,
-    };
-
-    setHistory((prev) => [record, ...prev]);
-
-    if (nextPlayerFunds <= 0) {
-      setTurnPhase('MATCH_OVER');
-    } else {
-      setTurnPhase('ROUND_RESULT');
+      setIsBusy(false);
+      setApiError(err instanceof Error ? err.message : '勝負確定に失敗しました。');
+      void initSession();
     }
   };
 
-  // Proceed to the next round
-  const advanceToNextRound = () => {
+  // Proceed to the next round via server
+  const advanceToNextRound = async () => {
+    if (isBusy) return;
     clearAllTimers();
-    const maxAffordableBet = playerFunds;
-    const nextBet = Math.min(betAmount, Math.max(100, maxAffordableBet));
-
-    setRoundNumber((r) => r + 1);
-    // Rotate dealer if previous dealer lost
-    if (roundSettlement?.winner === 'CPU' && dealer === 'PLAYER') {
-      setDealer('CPU');
-    } else if (roundSettlement?.winner === 'PLAYER' && dealer === 'CPU') {
-      setDealer('PLAYER');
+    setApiError(null);
+    setIsBusy(true);
+    try {
+      const data = await apiRequest<{ state: ServerSessionState }>(
+        '/api/game/next-round',
+        'POST',
+        {}
+      );
+      applyServerState(data.state);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : '次の局への移行に失敗しました。');
+    } finally {
+      setIsBusy(false);
     }
-
-    setBetAmount(nextBet);
-    setTurnPhase('BETTING');
-    setActiveRoller('PLAYER');
-    setThrowNumber(0);
-    setRemainingRerolls(MAX_REROLLS);
-    setPlayerOutcome(null);
-    setPlayerRerollsUsed(0);
-    setCpuOutcome(null);
-    setCpuRerollsUsed(0);
-    setRoundSettlement(null);
-    setCpuDialogue(currentOpponent.quotes.greeting);
   };
 
-  const maxAllowedBet = Math.max(100, playerFunds);
+  const handleClearHistory = async () => {
+    setApiError(null);
+    try {
+      const data = await apiRequest<{ state: ServerSessionState }>(
+        '/api/game/clear-history',
+        'POST',
+        {}
+      );
+      setHistory(data.state.history);
+    } catch (err) {
+      setApiError(err instanceof Error ? err.message : '履歴の削除に失敗しました。');
+    }
+  };
+
+  const maxAllowedBet = Math.max(0, playerFunds);
   const playerCanReroll = canPerformReroll(
     playerOutcome,
     remainingRerolls,
@@ -487,7 +582,9 @@ export default function App() {
         {activeTab === 'HISTORY' && (
           <MatchHistoryView
             history={history}
-            onClearHistory={() => setHistory([])}
+            onClearHistory={() => {
+              void handleClearHistory();
+            }}
             onReturnToArena={() => setActiveTab('ARENA')}
           />
         )}
@@ -495,23 +592,45 @@ export default function App() {
         {activeTab === 'RULES' && (
           <RulesSettingsView
             rerollRuleMode={rerollRuleMode}
-            onChangeRerollRuleMode={setRerollRuleMode}
+            onChangeRerollRuleMode={(mode) => {
+              void updateSettings({ ruleMode: mode });
+            }}
             enableShonben={enableShonben}
-            onToggleShonben={setEnableShonben}
+            onToggleShonben={(enabled) => {
+              void updateSettings({ enableShonben: enabled });
+            }}
             selectedOpponentId={selectedOpponentId}
             onSelectOpponent={(id) => {
-              setSelectedOpponentId(id);
-              setCpuDialogue(CPU_OPPONENTS[id].quotes.greeting);
+              void updateSettings({ opponentId: id });
             }}
             startingFunds={startingFunds}
-            onChangeStartingFunds={setStartingFunds}
-            onStartNewMatch={() => startNewMatch(selectedOpponentId, startingFunds)}
+            onChangeStartingFunds={(amt) => {
+              void updateSettings({ startingFunds: amt });
+            }}
+            onStartNewMatch={() => {
+              void startNewMatch(selectedOpponentId, startingFunds);
+            }}
             onReturnToArena={() => setActiveTab('ARENA')}
           />
         )}
 
         {activeTab === 'ARENA' && (
           <div className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
+            {apiError && (
+              <div
+                role="alert"
+                className="mb-4 px-4 py-3 rounded-lg border border-[#EF4444]/40 bg-[#EF4444]/10 text-xs sm:text-sm text-[#FCA5A5] flex items-center justify-between gap-4"
+              >
+                <span>{apiError}</span>
+                <button
+                  type="button"
+                  onClick={() => setApiError(null)}
+                  className="text-xs text-[#F5F2EB] underline shrink-0"
+                >
+                  閉じる
+                </button>
+              </div>
+            )}
             {/* Top Match Info & Mode Switcher Strip */}
             <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-5 border-b border-white/10">
               <div className="flex flex-wrap items-center gap-2 text-xs sm:text-sm text-[#B8B0A4] font-mono-tabular">
@@ -533,8 +652,7 @@ export default function App() {
                       type="button"
                       disabled={turnPhase !== 'BETTING' && turnPhase !== 'ROUND_RESULT'}
                       onClick={() => {
-                        setSelectedOpponentId(id);
-                        setCpuDialogue(CPU_OPPONENTS[id].quotes.greeting);
+                        void updateSettings({ opponentId: id });
                       }}
                       className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                         selectedOpponentId === id
@@ -550,7 +668,9 @@ export default function App() {
                 <div className="flex items-center gap-1 p-1 bg-[#1C1815] border border-white/10 rounded-lg">
                   <button
                     type="button"
-                    onClick={() => setRerollRuleMode('FREE_UP_TO_3')}
+                    onClick={() => {
+                      void updateSettings({ ruleMode: 'FREE_UP_TO_3' });
+                    }}
                     className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                       rerollRuleMode === 'FREE_UP_TO_3'
                         ? 'bg-white/15 text-[#F5F2EB]'
@@ -561,7 +681,9 @@ export default function App() {
                   </button>
                   <button
                     type="button"
-                    onClick={() => setRerollRuleMode('STRICT_MENASHI_3')}
+                    onClick={() => {
+                      void updateSettings({ ruleMode: 'STRICT_MENASHI_3' });
+                    }}
                     className={`px-3 py-1 text-xs font-medium rounded-md transition-colors whitespace-nowrap ${
                       rerollRuleMode === 'STRICT_MENASHI_3'
                         ? 'bg-white/15 text-[#F5F2EB]'
@@ -788,8 +910,11 @@ export default function App() {
 
                       <button
                         type="button"
-                        onClick={() => executePlayerRoll(true)}
-                        className="px-6 py-3.5 text-sm font-bold bg-[#DC2626] hover:bg-[#B91C1C] text-white rounded-xl transition-colors flex items-center justify-center gap-2 shadow-lg whitespace-nowrap shrink-0"
+                        disabled={isBusy || maxAllowedBet <= 0}
+                        onClick={() => {
+                          void executePlayerRoll(true);
+                        }}
+                        className="px-6 py-3.5 text-sm font-bold bg-[#DC2626] hover:bg-[#B91C1C] text-white rounded-xl transition-colors flex items-center justify-center gap-2 shadow-lg whitespace-nowrap shrink-0 disabled:opacity-50"
                       >
                         <Dices className="w-4 h-4" />
                         <span>サイコロを振る（1投目）</span>
@@ -827,8 +952,10 @@ export default function App() {
                         {playerCanReroll && remainingRerolls > 0 && (
                           <button
                             type="button"
-                            disabled={isRolling}
-                            onClick={() => executePlayerRoll(false)}
+                            disabled={isRolling || isBusy}
+                            onClick={() => {
+                              void executePlayerRoll(false);
+                            }}
                             className={`px-5 py-3 text-xs sm:text-sm font-bold rounded-xl transition-colors flex items-center gap-2 whitespace-nowrap ${
                               !isStrongPlayerRoll
                                 ? 'bg-[#DC2626] hover:bg-[#B91C1C] text-white'
@@ -842,8 +969,10 @@ export default function App() {
 
                         <button
                           type="button"
-                          disabled={isRolling}
-                          onClick={lockPlayerOutcomeAndStartCpuTurn}
+                          disabled={isRolling || isBusy}
+                          onClick={() => {
+                            void lockPlayerOutcomeAndStartCpuTurn();
+                          }}
                           className={`px-5 py-3 text-xs sm:text-sm font-bold rounded-xl transition-colors flex items-center gap-2 whitespace-nowrap ${
                             isStrongPlayerRoll || !playerCanReroll || remainingRerolls === 0
                               ? 'bg-[#F59E0B] hover:bg-[#D97706] text-[#141210]'

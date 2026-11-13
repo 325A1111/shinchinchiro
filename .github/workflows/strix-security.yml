@@ -1,0 +1,73 @@
+name: Strix AI Penetration Test & Security Gate
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      target_url:
+        description: 'Optional live deployment URL for black-box Strix scan'
+        required: false
+        default: ''
+      scan_mode:
+        description: 'Strix scan depth (quick | standard | deep)'
+        required: false
+        default: 'quick'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  typecheck-and-audit:
+    name: TypeScript & Dependency Audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run build
+      - name: Check npm dependency vulnerabilities
+        run: npm audit --audit-level=high
+
+  strix-source-scan:
+    name: Strix White-Box Source Security Scan
+    runs-on: ubuntu-latest
+    if: ${{ secrets.LLM_API_KEY != '' }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for diff-scoped PR reviews
+
+      - name: Install Strix (usestrix/strix)
+        run: curl -sSL https://strix.ai/install | bash
+
+      - name: Run Strix Autonomous Security Scan
+        env:
+          STRIX_LLM: ${{ secrets.STRIX_LLM || 'openai/gpt-4o' }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          strix -n -t ./ --scan-mode "${{ inputs.scan_mode || 'quick' }}"
+
+  strix-live-scan:
+    name: Strix Black-Box Live App Penetration Test
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.target_url != '' && secrets.LLM_API_KEY != '' }}
+    steps:
+      - name: Install Strix (usestrix/strix)
+        run: curl -sSL https://strix.ai/install | bash
+
+      - name: Run Strix Against Live Target
+        env:
+          STRIX_LLM: ${{ secrets.STRIX_LLM || 'openai/gpt-4o' }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          strix -n -t "${{ inputs.target_url }}" --scan-mode "${{ inputs.scan_mode || 'quick' }}"
